@@ -10,28 +10,28 @@ import javax.imageio.stream.*;
 public class RDPServer {
     private static final int PORT = 1234;
     private static volatile boolean running = false;
-    private static ExecutorService executor;
     private static ServerSocket serverSocket;
     private static float compressionQuality = 0.7f;
-    private static volatile int scrollSensitivity = 5;
+    private static int realFPS = 0;
+    private static long lastStatTime = System.currentTimeMillis();
 
     public static void main(String[] args) {
-        System.out.println("Starting Ultimate RDP Server...");
+        System.out.println("Starting Optimized RDP Server...");
         
-        // Enable hardware acceleration
-        System.setProperty("sun.java2d.opengl", "true");
-        System.setProperty("sun.java2d.d3d", "true");
-
         try {
             Robot robot = new Robot();
             Rectangle screenRect = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize());
             serverSocket = new ServerSocket(PORT);
-            serverSocket.setPerformancePreferences(0, 2, 1);
+            serverSocket.setPerformancePreferences(0, 2, 1); // Prioritize latency
             
-            // Print network information
-            printNetworkInfo();
-
-            executor = Executors.newFixedThreadPool(4); // Network, capture, compression, input
+            System.out.println("Server IP Addresses:");
+            NetworkInterface.getNetworkInterfaces().asIterator()
+                .forEachRemaining(ni -> ni.getInetAddresses().asIterator()
+                    .forEachRemaining(ia -> {
+                        if (!ia.isLoopbackAddress() && ia instanceof Inet4Address) {
+                            System.out.println("  " + ni.getDisplayName() + ": " + ia.getHostAddress());
+                        }
+                    }));
 
             while (true) {
                 Socket clientSocket = serverSocket.accept();
@@ -48,96 +48,76 @@ public class RDPServer {
                 clientSocket.setSendBufferSize(65536);
                 clientSocket.setReceiveBufferSize(65536);
 
-                // Create dedicated mouse wheel listener
-                MouseWheelListener wheelListener = e -> {
-                    try {
-                        DataOutputStream dos = new DataOutputStream(
-                            new BufferedOutputStream(clientSocket.getOutputStream()));
-                        dos.writeInt(2); // Scroll event type
-                        dos.writeInt(e.getWheelRotation() * scrollSensitivity);
-                        dos.flush();
-                    } catch (IOException ex) {
-                        if (running) shutdown();
-                    }
-                };
-                
-                Toolkit.getDefaultToolkit().addAWTEventListener(
-                    event -> {
-                        if (event instanceof MouseWheelEvent) {
-                            wheelListener.mouseWheelMoved((MouseWheelEvent)event);
-                        }
-                    }, AWTEvent.MOUSE_WHEEL_EVENT_MASK);
-
                 // Start services
-                executor.execute(() -> handleClientInput(robot, clientSocket));
-                executor.execute(() -> streamScreen(robot, screenRect, clientSocket));
+                new Thread(() -> handleClientInput(robot, clientSocket)).start();
+                new Thread(() -> streamScreen(robot, screenRect, clientSocket)).start();
             }
         } catch (Exception e) {
             System.err.println("Server error: " + e.getMessage());
+        } finally {
             shutdown();
         }
     }
 
     private static void streamScreen(Robot robot, Rectangle screenRect, Socket clientSocket) {
-        try {
-            OutputStream outputStream = new BufferedOutputStream(
-                clientSocket.getOutputStream(), 65536);
+        try (OutputStream outputStream = new BufferedOutputStream(clientSocket.getOutputStream(), 65536)) {
             ImageWriter writer = ImageIO.getImageWritersByFormatName("jpg").next();
             ImageWriteParam param = writer.getDefaultWriteParam();
             param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
-            
+            param.setCompressionQuality(compressionQuality);
+
             ByteArrayOutputStream baos = new ByteArrayOutputStream(65536);
             BufferedImage prevImage = null;
-            long lastFrameTime = System.currentTimeMillis();
-            int fps = 0;
+            int framesSent = 0;
 
             while (running) {
-                long captureStart = System.nanoTime();
+                long startTime = System.nanoTime();
+                
+                // Capture screen
                 BufferedImage image = robot.createScreenCapture(screenRect);
                 
-                if (prevImage != null && imagesEqual(prevImage, image)) {
-                    Thread.sleep(10);
-                    continue;
-                }
-                prevImage = image;
-
-                // Dynamic quality adjustment based on network latency
-                param.setCompressionQuality(compressionQuality);
-                
-                baos.reset();
-                writer.setOutput(new MemoryCacheImageOutputStream(baos));
-                writer.write(null, new IIOImage(image, null, null), param);
-                
-                synchronized (outputStream) {
-                    byte[] imageData = baos.toByteArray();
-                    DataOutputStream dos = new DataOutputStream(outputStream);
-                    dos.writeInt(imageData.length);
-                    dos.write(imageData);
-                    outputStream.flush();
+                // Only send if image changed (frame differencing)
+                if (prevImage == null || !imagesEqual(prevImage, image)) {
+                    baos.reset();
+                    writer.setOutput(new MemoryCacheImageOutputStream(baos));
+                    writer.write(null, new IIOImage(image, null, null), param);
+                    
+                    synchronized (outputStream) {
+                        DataOutputStream dos = new DataOutputStream(outputStream);
+                        dos.writeInt(baos.size());
+                        dos.write(baos.toByteArray());
+                        outputStream.flush();
+                    }
+                    framesSent++;
+                    prevImage = image;
                 }
 
-                // Performance monitoring
-                fps++;
-                if (System.currentTimeMillis() - lastFrameTime > 1000) {
-                    System.out.printf("FPS: %d, Quality: %.0f%%, Scroll Sens: %d%n",
-                        fps, compressionQuality * 100, scrollSensitivity);
-                    fps = 0;
-                    lastFrameTime = System.currentTimeMillis();
+                // Calculate real FPS every second
+                if (System.currentTimeMillis() - lastStatTime > 1000) {
+                    realFPS = framesSent;
+                    System.out.println("Actual FPS: " + realFPS + " | Quality: " + 
+                                      (int)(compressionQuality * 100) + "%");
+                    framesSent = 0;
+                    lastStatTime = System.currentTimeMillis();
                 }
 
-                long processTime = (System.nanoTime() - captureStart) / 1_000_000;
-                Thread.sleep(Math.max(0, 16 - processTime));
+                // Dynamic delay to maintain ~30FPS max
+                long processTime = (System.nanoTime() - startTime) / 1_000_000;
+                long sleepTime = Math.max(10, 33 - processTime); // Target ~30FPS
+                Thread.sleep(sleepTime);
             }
             writer.dispose();
         } catch (Exception e) {
-            if (running) shutdown();
+            if (running) {
+                System.err.println("Streaming error: " + e.getMessage());
+                shutdown();
+            }
         }
     }
 
     private static void handleClientInput(Robot robot, Socket clientSocket) {
-        try {
-            DataInputStream input = new DataInputStream(
-                new BufferedInputStream(clientSocket.getInputStream()));
+        try (DataInputStream input = new DataInputStream(
+            new BufferedInputStream(clientSocket.getInputStream()))) {
             
             while (running) {
                 int inputType = input.readInt();
@@ -151,21 +131,18 @@ public class RDPServer {
                         handleKeyboardEvent(robot, input);
                         break;
                         
-                    case 2: // Scroll event
-                        int scrollAmount = input.readInt();
-                        robot.mouseWheel(scrollAmount);
-                        break;
-                        
-                    case 3: // Settings change
+                    case 2: // Settings change
                         compressionQuality = input.readFloat();
-                        scrollSensitivity = input.readInt();
-                        System.out.println("Client updated settings: Quality=" + 
-                            compressionQuality + " ScrollSens=" + scrollSensitivity);
+                        System.out.println("Client changed quality to: " + 
+                                         (int)(compressionQuality * 100) + "%");
                         break;
                 }
             }
         } catch (Exception e) {
-            if (running) shutdown();
+            if (running) {
+                System.err.println("Input error: " + e.getMessage());
+                shutdown();
+            }
         }
     }
 
@@ -189,13 +166,12 @@ public class RDPServer {
     }
 
     private static boolean imagesEqual(BufferedImage img1, BufferedImage img2) {
-        // Fast comparison using hash codes
         if (img1.getWidth() != img2.getWidth() || img1.getHeight() != img2.getHeight()) {
             return false;
         }
         
         // Compare small random samples for performance
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 3; i++) {
             int x = (int)(Math.random() * img1.getWidth());
             int y = (int)(Math.random() * img1.getHeight());
             if (img1.getRGB(x, y) != img2.getRGB(x, y)) {
@@ -205,23 +181,11 @@ public class RDPServer {
         return true;
     }
 
-    private static void printNetworkInfo() throws Exception {
-        System.out.println("Available IP Addresses:");
-        NetworkInterface.getNetworkInterfaces().asIterator()
-            .forEachRemaining(ni -> ni.getInetAddresses().asIterator()
-                .forEachRemaining(ia -> {
-                    if (!ia.isLoopbackAddress() && ia instanceof Inet4Address) {
-                        System.out.println("  " + ni.getDisplayName() + ": " + ia.getHostAddress());
-                    }
-                }));
-    }
-
     private static void shutdown() {
         running = false;
         try {
-            if (executor != null) executor.shutdownNow();
             if (serverSocket != null) serverSocket.close();
-        } catch (Exception e) {
+        } catch (IOException e) {
             System.err.println("Shutdown error: " + e.getMessage());
         }
         System.out.println("Server stopped");
